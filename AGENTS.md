@@ -84,6 +84,19 @@ These points are extremely important - failing to follow them won't necessarily 
 Common mistakes that AI agents usually make:
 - Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
 - Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
+### Dev Constraints
+
+- **No `unwrap()`/`expect()` in production code paths.** Use `?`, `.ok()`, or explicit pattern matching. `expect()` is only acceptable in `main.rs` for truly unrecoverable startup failures (with a `// SAFETY:` comment).
+- **Domain errors via `thiserror`, propagation via `anyhow`.** Each module boundary has its own error enum.
+- **Never block the tokio reactor** with llama.cpp calls or lock-held I/O.
+- **All compiler warnings must be resolved.** Do not add `#[allow(...)]` to silence them. Address the root cause (remove
+  dead code, fix patterns, add `#[cfg(test)]` for test-only helpers, add `#[cfg(feature = "...")]` for gated features).
+  Exception: the as-vendored `llama-cpp-rs` fork in `third-parties/` emits upstream warnings (missing docs, deprecated
+  APIs) — per `third-parties/AGENTS.md` it stays untouched and is excluded from the policy.
+- **`mod.rs` is a facade, not an implementation.** See Module Map → module
+  organization rules; the `src/models/` split (`registry.rs` / `storage.rs` /
+  `mmproj.rs` / `capabilities.rs`) is the template.
+- **No `/tmp/` for temp files** — use the project's `tmp/` directory instead.
 
 ### Prohibited Actions
 
