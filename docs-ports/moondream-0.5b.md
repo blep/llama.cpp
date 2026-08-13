@@ -1,11 +1,24 @@
 # Moondream 0.5B port to llama.cpp (analysis / reference)
 
 Source: `/home/blep/prj/mallomar-server/docs/model-llama-cpp-ports.md` (candidate: Moondream 0.5B, vision)
-Status: analysis phase - validate official reference output before porting.
-Date: 2026-08-13
+Status: **deferred (2026-08-14)** - MOSS-TTS-Nano-100M selected as the first port target.
+Date: 2026-08-13 (updated 2026-08-14)
 
 Note: Moondream is a **vision-language model** (image caption / VQA), not TTS. "Validation" = run the official
 runtime on images. No audio output.
+
+## Port decision (2026-08-14): deferred behind MOSS-TTS-Nano-100M
+
+- Chosen order based on hard facts (see `docs-ports/moss-tts-nano-100m.md` "Port decision"):
+  Moondream's conversion source is **int8-quantized ONNX inside the `.mf`** (no raw safetensors,
+  no converter), its text arch is custom (no support), and the mtmd vision pipeline (tower +
+  multi-crop reconstruction + projector) has zero precedent in this fork.
+- **Correction to the source port doc**: the claim "the vision tower is shared with the 0.5B"
+  is disproved by the extracted dims - 0.5B vision is enc_dim 720, MLP ff 2690, projection
+  1440->8192->1024, while Moondream 2/3 use enc_dim 1152, ff 4304, projection 2048. The 0.5B
+  projector also needs the crop reconstruction concat (global + avg-pooled local tiles).
+- The source doc's "smallest surface / ~2-4 focused days" estimate predates discovering that the
+  `.mf` embeds only int8 DynamicQuantizeMatMul weights; the estimate is not actionable as written.
 
 ## License (verified 2026-08-13)
 
