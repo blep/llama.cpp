@@ -152,6 +152,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
+    { LLM_ARCH_MOSSTTS,          "mosstts"          },
     { LLM_ARCH_VOXTRAL_RT_ASR, "voxtral_rt_asr" },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };

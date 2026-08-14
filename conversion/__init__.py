@@ -272,6 +272,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "YoutuVLForConditionalGeneration": "deepseek",
     "modeling_grove_moe.GroveMoeForCausalLM": "grovemoe",
     "modeling_sarvam_moe.SarvamMoEForCausalLM": "bailingmoe",
+    "MossTTSNanoForCausalLM": "mosstts",
 }
 
 
@@ -322,6 +323,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "Qwen3ASRForConditionalGeneration": "qwen3vl",
     "Qwen3OmniMoeForConditionalGeneration": "qwen3vl",
     "PocketTTSModel": "pockettts",
+    "MossTTSNanoForCausalLM": "mosstts",
     "Qwen3TTSForConditionalGeneration": "qwen3tts",
     "Qwen3VLForConditionalGeneration": "qwen3vl",
     "Qwen3VLMoeForConditionalGeneration": "qwen3vl",
