@@ -120,6 +120,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen3tts(params);
         case LLM_ARCH_POCKETTTS:
             return new llama_model_pockettts(params);
+        case LLM_ARCH_MOSSTTS:
+            return new llama_model_mosstts(params);
         case LLM_ARCH_VOXTRAL_RT_ASR:
             return new llama_model_voxtral_rt_asr(params);
         case LLM_ARCH_PHI2:
@@ -2957,8 +2959,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
-        // HY_V4 rotates consecutive pairs, matching the reference implementation
+// HY_V4 rotates consecutive pairs, matching the reference implementation
         case LLM_ARCH_HY_V4:
+        case LLM_ARCH_MOSSTTS:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
