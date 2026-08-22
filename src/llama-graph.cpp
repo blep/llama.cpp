@@ -172,6 +172,13 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_time_emb::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (time_emb && data) {
+        ggml_backend_tensor_set(time_emb, data, 0, n_embd * ggml_element_size(time_emb));
+    }
+}
+
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
     if (pos_bucket) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -2375,6 +2382,20 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     cur = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
     ggml_set_input(cur);
     ggml_set_name(cur, "attn_scale");
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_time_emb(const float * data) const {
+    auto inp = std::make_unique<llm_graph_input_time_emb>(data, n_embd);
+
+    auto & cur = inp->time_emb;
+
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_embd);
+    ggml_set_input(cur);
+    ggml_set_name(cur, "time_emb");
 
     res->add_input(std::move(inp));
 

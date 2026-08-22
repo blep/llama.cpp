@@ -120,6 +120,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_pockettts(params);
         case LLM_ARCH_MOSSTTS:
             return new llama_model_mosstts(params);
+        case LLM_ARCH_VOXTRAL_RT_ASR:
+            return new llama_model_voxtral_rt_asr(params);
         case LLM_ARCH_PHI2:
             return new llama_model_phi2(params);
         case LLM_ARCH_PHI3:
@@ -2718,6 +2720,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_VOXTRAL_RT_ASR:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:

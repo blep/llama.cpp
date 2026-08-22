@@ -86,6 +86,12 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
 
+// encode an audio log-mel spectrogram through the audio tower (causal encoder +
+// adapter). `mel` is [n_mel, n_frames] (frame contiguous within each mel bin);
+// `out` receives the flattened [dec_dim, n_frames_out] adapter output.
+bool clip_audio_encode(struct clip_ctx * ctx, int n_threads,
+                       const float * mel, int n_mel, int n_frames, std::vector<float> & out);
+
 enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes

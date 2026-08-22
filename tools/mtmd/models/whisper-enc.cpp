@@ -135,3 +135,80 @@ ggml_cgraph * clip_graph_whisper_enc::build() {
 
     return gf;
 }
+
+// Voxtral-Mini-4B-Realtime-2602 causal audio encoder.
+// Causal conv stem (left-only pad) + RoPE transformer (NEOX, sliding-window
+// causal mask) + temporal adapter (Linear + GELU + Linear, downsample 4x).
+// The conv, the 32 encoder blocks and the adapter weights all live in the
+// mmproj GGUF under the mtmd `a.*` naming.
+ggml_cgraph * clip_graph_whisper_enc_causal::build() {
+    const int64_t n_frames = img.nx();
+    const int64_t n_mel    = img.ny();
+    GGML_ASSERT(n_mel == model.conv1d_1_w->ne[1]);
+
+    // causal conv stem: left pad (kernel - stride), stride 1 then stride 2
+    ggml_tensor * inp = build_inp_raw(1); // [n_frames, n_mel, 1, 1]
+
+    ggml_tensor * cur = ggml_pad_ext(ctx0, inp, 2, 0, 0, 0, 0, 0, 0, 0);
+    cur = ggml_conv_1d(ctx0, model.conv1d_1_w, cur, 1, 0, 1); // [OL, OC, N]
+    cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model.conv1d_1_b, 1, model.conv1d_1_w->ne[2], 1));
+    cur = ggml_gelu_erf(ctx0, cur);
+    cb(cur, "conv1", -1);
+
+    cur = ggml_pad_ext(ctx0, cur, 1, 0, 0, 0, 0, 0, 0, 0);
+    cur = ggml_conv_1d(ctx0, model.conv1d_2_w, cur, 2, 0, 1); // [OL, OC, N]
+    cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model.conv1d_2_b, 1, model.conv1d_2_w->ne[2], 1));
+    cur = ggml_gelu_erf(ctx0, cur);
+    cb(cur, "conv2", -1);
+
+    const int64_t n_pos = cur->ne[0];
+    GGML_ASSERT(n_pos == n_frames / 2);
+
+    // transpose to [n_embd, n_pos]
+    inp = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+    cb(inp, "after_conv1d", -1);
+
+    // sanity check (only check one layer, but it should be the same for all)
+    GGML_ASSERT(model.layers[0].ln_1_w && model.layers[0].ln_2_w);
+    GGML_ASSERT(model.layers[0].q_b);
+    GGML_ASSERT(model.layers[0].v_b);
+    GGML_ASSERT(!model.layers[0].k_b); // no bias for k
+
+    // RoPE positions + causal sliding-window mask (set by clip_encode)
+    ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pos);
+    ggml_set_name(inp_pos, "inp_pos");
+    ggml_set_input(inp_pos);
+
+    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pos, n_pos);
+    ggml_set_name(kq_mask, "kq_mask");
+    ggml_set_input(kq_mask);
+
+    // RoPE (rotate_half / NeoX), applied per-head on the reshaped Q/K
+    auto add_pos_rope = [&](ggml_tensor * t, const clip_layer &) -> ggml_tensor * {
+        return ggml_rope_ext(ctx0, t, inp_pos, nullptr,
+            d_head, GGML_ROPE_TYPE_NEOX, 0, hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    };
+
+    build_vit_opts opts;
+    opts.attn_mask = kq_mask;
+
+    cur = build_vit(inp, n_pos, NORM_TYPE_RMS, hparams.ffn_op,
+                    nullptr, add_pos_rope, opts);
+    cb(cur, "after_transformer", -1);
+
+    // temporal adapter: [n_embd, n_pos] -> [n_embd*down, n_pos/down] -> mm2(gelu(mm1(x)))
+    const int64_t downsample = hparams.audio_proj_downsample_rate > 0
+                               ? hparams.audio_proj_downsample_rate : 4;
+    GGML_ASSERT(n_pos % downsample == 0);
+    cur = ggml_reshape_2d(ctx0, cur, n_embd * downsample, n_pos / downsample);
+    cur = build_ffn(cur,
+        model.mm_1_w, nullptr,
+        nullptr, nullptr,
+        model.mm_2_w, nullptr,
+        FFN_GELU_ERF, -1);
+    cb(cur, "projected", -1);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return gf;
+}
