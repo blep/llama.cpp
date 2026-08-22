@@ -726,6 +726,23 @@ struct llama_model_pockettts : public llama_model_base {
 };
 
 
+struct llama_model_voxtral_rt_asr : public llama_model_base {
+    llama_model_voxtral_rt_asr(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // precomputed sinusoidal time embedding (t = delay_tokens), fed as a
+    // graph input to the per-layer ada RMS-norm t-cond MLP
+    std::vector<float> time_emb_cpu;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_codeshell : public llama_model_base {
     llama_model_codeshell(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
