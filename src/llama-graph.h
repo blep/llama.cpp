@@ -186,6 +186,22 @@ public:
     const float    f_attn_temp_offset;
 };
 
+// constant per-session input: the sinusoidal time embedding for the
+// voxtral_rt_asr ada RMS-norm t-cond (t = n_delay_tokens, fixed)
+class llm_graph_input_time_emb : public llm_graph_input_i {
+public:
+    llm_graph_input_time_emb(const float * data, int64_t n_embd)
+        : data(data), n_embd(n_embd) {}
+    virtual ~llm_graph_input_time_emb() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * time_emb = nullptr; // F32 [n_embd]
+
+    const float * data  = nullptr;
+    const int64_t n_embd = 0;
+};
+
 class llm_graph_input_pos_bucket : public llm_graph_input_i {
 public:
     llm_graph_input_pos_bucket(const llama_hparams & hparams) : hparams(hparams) {}
@@ -1164,6 +1180,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
+    ggml_tensor * build_inp_time_emb(const float * data) const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;

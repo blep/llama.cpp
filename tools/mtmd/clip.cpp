@@ -1025,6 +1025,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_whisper_enc>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_VOXTRAL_RT_ASR:
+            {
+                builder = std::make_unique<clip_graph_whisper_enc_causal>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_KIMIVL:
             {
                 builder = std::make_unique<clip_graph_kimivl>(ctx, img);
@@ -1778,6 +1782,23 @@ struct clip_model_loader {
                         log_ffn_op = "gelu_erf"; // temporary solution for logging
 
                         // audio preprocessing params
+                        hparams.audio_chunk_len    = 30; // in seconds
+                        hparams.audio_sample_rate  = 16000;
+                        hparams.audio_n_fft        = 400;
+                        hparams.audio_window_len   = 400;
+                        hparams.audio_hop_len      = 160;
+                    } break;
+                case PROJECTOR_TYPE_VOXTRAL_RT_ASR:
+                    {
+                        // causal whisper-style encoder (RoPE 1e6, sliding window,
+                        // SILU FFN) + temporal adapter (downsample 4x)
+                        get_u32(KEY_A_PROJ_DOWNSAMPLE_RATE, hparams.audio_proj_downsample_rate, false);
+                        get_u32(KEY_A_ATTN_WINDOW_SIZE,     hparams.attn_window_size, false);
+                        hparams.ffn_op = FFN_SILU;
+                        log_ffn_op = "silu";
+                        hparams.rope_theta = 1.0e6f;
+
+                        // audio preprocessing params (torch.stft reflect-pad mel)
                         hparams.audio_chunk_len    = 30; // in seconds
                         hparams.audio_sample_rate  = 16000;
                         hparams.audio_n_fft        = 400;
@@ -3132,6 +3153,17 @@ struct clip_model_loader {
                     model.mm_1_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "weight"));
                     model.mm_2_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "weight"));
                 } break;
+            case PROJECTOR_TYPE_VOXTRAL_RT_ASR:
+                {
+                    // causal conv stem (a.post_ln is loaded by the generic loader)
+                    model.conv1d_1_w = get_tensor(string_format(TN_CONV1D, 1, "weight"));
+                    model.conv1d_1_b = get_tensor(string_format(TN_CONV1D, 1, "bias"));
+                    model.conv1d_2_w = get_tensor(string_format(TN_CONV1D, 2, "weight"));
+                    model.conv1d_2_b = get_tensor(string_format(TN_CONV1D, 2, "bias"));
+                    // temporal adapter (Linear + GELU + Linear)
+                    model.mm_1_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "weight"));
+                    model.mm_2_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "weight"));
+                } break;
             case PROJECTOR_TYPE_MUSIC_FLAMINGO:
                 {
                     model.conv1d_1_w = get_tensor(string_format(TN_CONV1D, 1, "weight"));
@@ -4247,6 +4279,15 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                     n_patches /= 2;
                 }
             } break;
+        case PROJECTOR_TYPE_VOXTRAL_RT_ASR:
+            {
+                // conv1 (stride 1) keeps frames; conv2 (stride 2) halves them;
+                // temporal adapter downsamples by the factor (4x)
+                n_patches = img->nx() / 2;
+                const int downsample = ctx->model.hparams.audio_proj_downsample_rate;
+                GGML_ASSERT(downsample > 0);
+                n_patches /= downsample;
+            } break;
         case PROJECTOR_TYPE_QWEN3A:
             {
                 // chunk_size=100 frames --> 3x stride-2 conv2d --> 13 tokens per chunk
@@ -4404,6 +4445,32 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     return clip_encode(ctx, &params);
 }
 
+// audio-tower encode: mel [n_mel, n_frames] -> causal encoder + adapter output.
+// the clip input (build_inp_raw [nx=frames, ny=mel]) is frame-major, so the
+// caller's mel-major [m*n_frames + f] layout is transposed here.
+bool clip_audio_encode(clip_ctx * ctx, int n_threads,
+                       const float * mel, int n_mel, int n_frames, std::vector<float> & out) {
+    GGML_ASSERT(ctx->model.modality == CLIP_MODALITY_AUDIO);
+
+    clip_image_f32 img;
+    img.set_size({ n_frames, n_mel }, false, /*is_audio*/ true);
+    std::vector<float> buf((size_t) n_frames * n_mel);
+    for (int m = 0; m < n_mel; ++m) {
+        for (int f = 0; f < n_frames; ++f) {
+            buf[(size_t) f + (size_t) m * n_frames] = mel[(size_t) m * n_frames + f];
+        }
+    }
+    img.cpy_buf(buf);
+
+    clip_image_f32_batch batch;
+    batch.is_audio = true;
+    batch.entries.push_back(std::move(img));
+
+    // clip_encode only copies when the output buffer is pre-sized
+    out.resize((size_t) clip_n_output_tokens(ctx, &img) * (size_t) clip_n_mmproj_embd(ctx));
+    return clip_image_batch_encode(ctx, n_threads, &batch, out);
+}
+
 // persisted state slots of the gen-audio decoder, per pipeline
 static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hparams, const clip_model & model) {
     switch (model.proj_type) {
@@ -4520,6 +4587,31 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
         set_input_f32("kq_mask", mask);
     };
+
+    // rope positions + causal attention mask of the voxtral-realtime encoder
+    auto set_voxtral_realtime_inputs = [&]() {
+        const int64_t n_pos = ggml_nelements(get_inp_tensor("inp_pos"));
+        GGML_ASSERT(n_pos > 0);
+        std::vector<int32_t> positions((size_t) n_pos);
+        for (int64_t i = 0; i < n_pos; i++) {
+            positions[(size_t) i] = (int32_t) i;
+        }
+        set_input_i32("inp_pos", positions);
+
+        // causal sliding-window mask (window 750; a full sequence stays under it)
+        const int64_t window = hparams.attn_window_size;
+        std::vector<float> mask((size_t) n_pos * n_pos, -INFINITY);
+        for (int64_t q = 0; q < n_pos; q++) {
+            for (int64_t k = 0; k < n_pos; k++) {
+                const int64_t delta = q - k;
+                if (delta >= 0 && (window == 0 || delta < window)) {
+                    mask[(size_t) q * n_pos + k] = 0.0f;
+                }
+            }
+        }
+        set_input_f32("kq_mask", mask);
+    };
+
 
     // set input pixel values
     if (!imgs.is_audio) {
@@ -5155,6 +5247,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             {
                 set_pockettts_tfm_inputs();
             } break;
+        case PROJECTOR_TYPE_VOXTRAL_RT_ASR:
+            {
+                set_voxtral_realtime_inputs();
+            } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
                 if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
@@ -5775,7 +5871,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
                 GGML_ABORT("Output buffer size mismatch");
             }
-            ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
+            // prefer the raw data pointer when it is host-accessible; the CPU
+            // scheduler can leave the backend buffer stale after compute
+            if (embeddings->data != NULL && embeddings->buffer &&
+                ggml_backend_buffer_is_host(embeddings->buffer)) {
+                memcpy(out_batch_embd.data(), embeddings->data, ggml_nbytes(embeddings));
+            } else {
+                ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
+            }
         } else {
             LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
         }
@@ -5959,6 +6062,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_fc_w->ne[1];
         case PROJECTOR_TYPE_ULTRAVOX:
         case PROJECTOR_TYPE_VOXTRAL:
+        case PROJECTOR_TYPE_VOXTRAL_RT_ASR:
         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_MERALION:

@@ -157,6 +157,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
+    { LLM_ARCH_VOXTRAL_RT_ASR, "voxtral_rt_asr" },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -367,6 +368,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
+
+    { LLM_KV_DELAY_TOKENS,               "%s.delay_tokens" },
+    { LLM_KV_ADA_NORM_DIM,               "%s.ada_norm_dim" },
     // sentence-transformers dense modules feature dims
     { LLM_KV_DENSE_2_FEAT_IN,        "%s.dense_2_feat_in"  },
     { LLM_KV_DENSE_2_FEAT_OUT,       "%s.dense_2_feat_out" },
@@ -645,6 +649,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_TIME_MIX_K_A,                           "blk.%d.time_mix_k_a" },
     { LLM_TENSOR_TIME_MIX_R_K,                           "blk.%d.time_mix_r_k" },
     { LLM_TENSOR_CONV1D,                                 "conv1d" },
+    { LLM_TENSOR_ADA_NORM_T_COND_0,                      "blk.%d.ada_norm_t_cond.0" },
+    { LLM_TENSOR_ADA_NORM_T_COND_2,                      "blk.%d.ada_norm_t_cond.2" },
     { LLM_TENSOR_CONVNEXT_DW,                            "convnext.%d.dw" },
     { LLM_TENSOR_CONVNEXT_NORM,                          "convnext.%d.norm" },
     { LLM_TENSOR_CONVNEXT_PW1,                           "convnext.%d.pw1" },
@@ -922,6 +928,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // this tensor is loaded for T5, but never used
     {LLM_TENSOR_DEC_CROSS_ATTN_REL_B,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
     {LLM_TENSOR_CONV1D,                     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_IM2COL}},
+    {LLM_TENSOR_ADA_NORM_T_COND_0,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ADA_NORM_T_COND_2,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_POS_NET_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_POS_NET_NORM1,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_POS_NET_NORM2,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},

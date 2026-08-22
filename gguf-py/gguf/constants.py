@@ -631,6 +631,7 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
+    VOXTRAL_RT_ASR = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -861,6 +862,8 @@ class MODEL_TENSOR(IntEnum):
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
     CONV1D               = auto()
+    ADA_NORM_T_COND_0     = auto()
+    ADA_NORM_T_COND_2     = auto()
     CONVNEXT_DW          = auto()
     CONVNEXT_NORM        = auto()
     CONVNEXT_PW1         = auto()
@@ -1387,6 +1390,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NANBEIGE:         "nanbeige",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
+    MODEL_ARCH.VOXTRAL_RT_ASR: "voxtral_rt_asr",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -1615,6 +1619,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.CLS_OUT:                   "cls.output",
     MODEL_TENSOR.CLS_NORM:                  "cls.norm",
     MODEL_TENSOR.CONV1D:                    "conv1d",
+    MODEL_TENSOR.ADA_NORM_T_COND_0:         "blk.{bid}.ada_norm_t_cond.0",
+    MODEL_TENSOR.ADA_NORM_T_COND_2:         "blk.{bid}.ada_norm_t_cond.2",
     MODEL_TENSOR.CONVNEXT_DW:               "convnext.{bid}.dw",
     MODEL_TENSOR.CONVNEXT_NORM:             "convnext.{bid}.norm",
     MODEL_TENSOR.CONVNEXT_PW1:              "convnext.{bid}.pw1",
@@ -5547,6 +5553,23 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
     ],
+
+    MODEL_ARCH.VOXTRAL_RT_ASR: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.ADA_NORM_T_COND_0,
+        MODEL_TENSOR.ADA_NORM_T_COND_2,
+    ],
 }
 
 # tensors that will not be serialized
@@ -5809,6 +5832,7 @@ class VisionProjectorType:
     GLMA = "glma" # audio
     QWEN25O = "qwen2.5o" # omni
     VOXTRAL = "voxtral"
+    VOXTRAL_RT_ASR = "voxtral_rt_asr"
     MERALION = "meralion"  # audio: Whisper + gated MLP adaptor
     LFM2 = "lfm2"
     KIMIVL = "kimivl"

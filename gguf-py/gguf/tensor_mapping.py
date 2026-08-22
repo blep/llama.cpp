@@ -397,6 +397,14 @@ class TensorNameMap:
         ),
 
         # Feed-forward norm
+        MODEL_TENSOR.ADA_NORM_T_COND_0: (
+            "model.layers.{bid}.ada_rms_norm.linear1",    # voxtral_rt_asr
+        ),
+
+        MODEL_TENSOR.ADA_NORM_T_COND_2: (
+            "model.layers.{bid}.ada_rms_norm.linear2",    # voxtral_rt_asr
+        ),
+
         MODEL_TENSOR.FFN_NORM: (
             "gpt_neox.layers.{bid}.post_attention_layernorm",                # gptneox
             "transformer.h.{bid}.ln_2",                                      # gpt2 refact qwen jais exaone
@@ -2313,7 +2321,8 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_POST_NORM: (
             "audio_tower.layer_norm", # ultravox
-            "audio_encoder.dots_encoder.speech_encoder.layer_norm", # dots3note
+"audio_encoder.dots_encoder.speech_encoder.layer_norm", # dots3note
+            "audio_tower.norm", # voxtral_rt_asr
             "audio_tower.ln_post", # qwen2omni
             "encoder.layer_norm", # mimo-audio-tokenizer
         ),
@@ -2423,6 +2432,7 @@ class TensorNameMap:
         MODEL_TENSOR.A_ENC_FFN_UP: (
             "audio_encoder.dots_encoder.speech_encoder.layers.{bid}.fc1_up", # dots3note (split from fc1 in conversion code)
             "audio_tower.layers.{bid}.fc1", # ultravox
+            "audio_tower.layers.{bid}.mlp.up_proj", # voxtral_rt_asr
             "conformer.layers.{bid}.feed_forward1.linear1", # lfm2
             "conformer.layers.{bid}.ffw_layer_start.ffw_layer_1", # gemma3n
             "conformer.layers.{bid}.feed_forward1.ffw_layer_1", # gemma4
@@ -2432,12 +2442,14 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.A_ENC_FFN_GATE: (
-            "audio_encoder.dots_encoder.speech_encoder.layers.{bid}.fc1_gate", # dots3note (split from fc1 in conversion code)
+"audio_encoder.dots_encoder.speech_encoder.layers.{bid}.fc1_gate", # dots3note (split from fc1 in conversion code)
+            "audio_tower.layers.{bid}.mlp.gate_proj", # voxtral_rt_asr
         ),
 
         MODEL_TENSOR.A_ENC_FFN_DOWN: (
             "audio_encoder.dots_encoder.speech_encoder.layers.{bid}.fc2", # dots3note
             "audio_tower.layers.{bid}.fc2", # ultravox
+            "audio_tower.layers.{bid}.mlp.down_proj", # voxtral_rt_asr
             "conformer.layers.{bid}.feed_forward1.linear2", # lfm2
             "conformer.layers.{bid}.ffw_layer_start.ffw_layer_2", # gemma3n
             "conformer.layers.{bid}.feed_forward1.ffw_layer_2", # gemma4

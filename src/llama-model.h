@@ -307,6 +307,10 @@ struct llama_layer {
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
     struct ggml_tensor * attn_rel_b_cross = nullptr;
 
+    // voxtral_rt_asr: per-layer adaptive RMS-norm time conditioning MLP
+    struct ggml_tensor * ada_norm_t_cond_0 = nullptr;
+    struct ggml_tensor * ada_norm_t_cond_2 = nullptr;
+
     // normalization
     struct ggml_tensor * ffn_norm         = nullptr;
     struct ggml_tensor * ffn_norm_b       = nullptr;

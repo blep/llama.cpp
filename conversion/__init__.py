@@ -274,6 +274,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "UnlimitedOCRForCausalLM": "deepseek",
     "VLlama3ForCausalLM": "llama",
     "VoxtralForConditionalGeneration": "llama",
+    "VoxtralRealtimeForConditionalGeneration": "voxtral_rt_asr",
     "WavTokenizerDec": "wavtokenizer",
     "XLMRobertaForSequenceClassification": "bert",
     "XLMRobertaModel": "bert",
@@ -349,6 +350,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "UltravoxModel": "ultravox",
     "UnlimitedOCRForCausalLM": "deepseek",
     "VoxtralForConditionalGeneration": "ultravox",
+    "VoxtralRealtimeForConditionalGeneration": "voxtral_rt_asr",
     "YoutuVLForConditionalGeneration": "youtuvl",
 }
 

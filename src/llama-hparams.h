@@ -172,9 +172,13 @@ struct llama_hparams {
     // the size of the sliding window (0 - no SWA)
     uint32_t n_swa = 0;
 
-    // see llama_non_causal_type
+// see llama_non_causal_type
     // note: for SWA_FULL, older tokens (outside the current ubatch) are still window-clipped
     llama_non_causal_type non_causal_type = LLAMA_NON_CAUSAL_TYPE_ALL;
+
+    // voxtral_rt_asr: decoder-side streaming decode config
+    uint32_t n_ada_norm_dim = 0;
+    uint32_t n_delay_tokens = 0;
 
     // if is_swa_impl[il] == 1, then layer il is SWA
     // if is_swa_impl[il] == 0, then layer il is dense (i.e. non-SWA)
