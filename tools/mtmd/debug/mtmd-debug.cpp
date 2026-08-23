@@ -18,6 +18,104 @@
 // INTERNAL TOOL FOR DEBUGGING PURPOSES ONLY
 // NOT INTENDED FOR PUBLIC USE
 
+static bool load_wav_file(const std::string & path, std::vector<float> & audio_out) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    char hdr[12];
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
+        fclose(f);
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    const long file_size = ftell(f);
+    fseek(f, 12, SEEK_SET);
+
+    uint16_t audio_format = 0, num_channels = 0, bits_per_sample = 0;
+    uint32_t sample_rate = 0;
+    bool have_fmt = false, have_data = false;
+    std::vector<int16_t> pcm;
+    std::vector<float>   f32;
+    while (true) {
+        char chunk[8];
+        if (fread(chunk, 1, 8, f) != 8) {
+            break;
+        }
+        uint32_t chunk_size = 0;
+        memcpy(&chunk_size, chunk + 4, 4);
+        // sanity check: chunk must fit in the remaining file
+        const long pos = ftell(f);
+        if (chunk_size > (uint32_t) (file_size - pos)) {
+            fclose(f);
+            return false;
+        }
+        if (memcmp(chunk, "fmt ", 4) == 0) {
+            uint32_t dummy = 0;
+            const size_t n_read =
+                fread(&audio_format, 2, 1, f) +
+                fread(&num_channels, 2, 1, f) +
+                fread(&sample_rate, 4, 1, f) +
+                fread(&dummy, 4, 1, f) +  // nAvgBytesPerSec (unused)
+                fread(&dummy, 2, 1, f) +  // nBlockAlign (unused)
+                fread(&bits_per_sample, 2, 1, f);
+            if (n_read != 6) {
+                fclose(f);
+                return false;
+            }
+            if (chunk_size > 16) {
+                fseek(f, pos + chunk_size, SEEK_SET);
+            }
+            have_fmt = true;
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            if (audio_format == 1 && bits_per_sample == 16) {
+                if (chunk_size > 1u << 30) {  // cap at ~1 GiB of PCM
+                    fclose(f);
+                    return false;
+                }
+                pcm.resize(chunk_size / 2);
+                if (fread(pcm.data(), 2, pcm.size(), f) != pcm.size()) {
+                    fclose(f);
+                    return false;
+                }
+            } else if (audio_format == 3 && bits_per_sample == 32) {
+                if (chunk_size > 1u << 30) {
+                    fclose(f);
+                    return false;
+                }
+                f32.resize(chunk_size / 4);
+                if (fread(f32.data(), 4, f32.size(), f) != f32.size()) {
+                    fclose(f);
+                    return false;
+                }
+            } else {
+                fclose(f);
+                return false;
+            }
+            have_data = true;
+        } else {
+            fseek(f, pos + chunk_size + (chunk_size % 2), SEEK_SET);
+        }
+    }
+    fclose(f);
+
+    if (!have_fmt || !have_data) {
+        return false;
+    }
+    if (sample_rate != 16000 || num_channels != 1) {
+        return false;
+    }
+    if (!pcm.empty()) {
+        audio_out.resize(pcm.size());
+        for (size_t i = 0; i < pcm.size(); i++) {
+            audio_out[i] = (float) pcm[i] / 32768.0f;
+        }
+    } else {
+        audio_out = f32;
+    }
+    return !audio_out.empty();
+}
+
 static void show_additional_info(int /*argc*/, char ** argv) {
     LOG(
         "Internal debugging tool for mtmd; See mtmd-debug.md for the pytorch equivalent code\n"
@@ -266,6 +364,13 @@ int main(int argc, char ** argv) {
             for (int i = 0; i < inp_size; ++i) {
                 pcm_samples[i] = sinf(2 * pi * freq * i / sample_rate);
             }
+        } else if (input.find('/') != std::string::npos || input.find('.') != std::string::npos) {
+            // treat as a WAV file path
+            LOG_INF("Loading audio file: %s\n", input.c_str());
+            if (!load_wav_file(input, pcm_samples)) {
+                LOG_ERR("ERR: cannot load WAV file %s\n", input.c_str());
+                return 1;
+            }
         } else {
             LOG_ERR("ERR: Invalid input specified with --image/--audio\n");
             show_additional_info(argc, argv);
@@ -276,7 +381,12 @@ int main(int argc, char ** argv) {
         LOG_INF("Running preprocessing pass for input type: %s\n", input.c_str());
         if (pcm_samples.size() > 0) {
             LOG_INF("Input audio with %zu samples, type: %s\n", pcm_samples.size(), input.c_str());
-            mtmd_debug_preprocess_audio(ctx_mtmd.get(), pcm_samples);
+            const char * mel_out = getenv("MTMD_MEL_OUT");
+            if (mel_out != nullptr && mel_out[0] != '\0') {
+                mtmd_debug_preprocess_audio_dump(ctx_mtmd.get(), pcm_samples, mel_out);
+            } else {
+                mtmd_debug_preprocess_audio(ctx_mtmd.get(), pcm_samples);
+            }
         } else {
             LOG_INF("Input image with dimensions %d x %d, type: %s\n", inp_size, inp_size, input.c_str());
             mtmd_debug_preprocess_image(ctx_mtmd.get(), rgb_values, inp_size, inp_size);

@@ -2497,6 +2497,16 @@ const llama_vocab * llama_model_get_vocab(const llama_model * model) {
     return &model->vocab;
 }
 
+const struct ggml_tensor * llama_model_get_tensor_token_embd(const llama_model * model) {
+    const std::string name = "token_embd.weight";
+    for (const auto & pair : model->tensors_by_name) {
+        if (pair.first == name) {
+            return pair.second;
+        }
+    }
+    return nullptr;
+}
+
 void llama_free_model(llama_model * model) {
     llama_model_free(model);
 }

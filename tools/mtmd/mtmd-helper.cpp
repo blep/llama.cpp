@@ -13,7 +13,7 @@
 #include "llama.h"
 
 #include <algorithm>
-#include <cinttypes>
+#include <cstring>
 #include <vector>
 
 //#define MTMD_AUDIO_DEBUG
@@ -929,6 +929,118 @@ int32_t mtmd_helper_video_read_next(mtmd_helper_video * ctx,
     GGML_UNUSED(out_text);
     GGML_ASSERT(false && "video is not supported in this build (MTMD_VIDEO is set to OFF)");
 #endif
+}
+
+int32_t mtmd_helper_eval_voxtral_realtime(
+        mtmd_context * ctx,
+        struct llama_context * lctx,
+        const mtmd_input_chunk * chunk,
+        const struct mtmd_helper_voxtral_realtime_params * params,
+        llama_token * out_tokens,
+        size_t * n_out_tokens) {
+    GGML_ASSERT(n_out_tokens != nullptr);
+    GGML_ASSERT(params != nullptr);
+
+    if (!mtmd_decode_use_dual_stream(ctx)) {
+        LOG_ERR("%s: model does not use the dual-stream decode path\n", __func__);
+        return 2;
+    }
+    if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        LOG_ERR("%s: chunk is not an audio chunk\n", __func__);
+        return 2;
+    }
+
+    const size_t capacity = *n_out_tokens;
+    const size_t n_prefix = [&]() {
+        size_t n = 0;
+        mtmd_input_chunk_get_prefix_tokens(chunk, &n);
+        return n;
+    }();
+    const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    if (n_prefix == 0 || n_prefix > n_tokens) {
+        LOG_ERR("%s: chunk has %zu prefix tokens for %zu positions\n", __func__, n_prefix, n_tokens);
+        return 1;
+    }
+
+    const llama_model * model = llama_get_model(lctx);
+    const int32_t n_embd = llama_model_n_embd_inp(model);
+
+    // 1. encode the audio chunk (dual-stream summation for the prefix positions)
+    int32_t ret = mtmd_encode_chunk(ctx, chunk);
+    if (ret != 0) {
+        LOG_ERR("%s: failed to encode audio chunk\n", __func__);
+        return 1;
+    }
+    float * encoded_embd = mtmd_get_output_embd(ctx);
+
+    // 2. prefill the prefix positions 0..n_prefix-1 with the summed embeddings
+    {
+        llama_batch batch = llama_batch_init((int32_t) n_prefix, n_embd, 1);
+        batch.n_tokens = (int32_t) n_prefix;
+        for (size_t i = 0; i < n_prefix; ++i) {
+            for (int32_t j = 0; j < n_embd; ++j) {
+                batch.embd[i * n_embd + j] = encoded_embd[i * n_embd + j];
+            }
+            batch.pos[i]       = (llama_pos) i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = params->seq_id;
+            batch.logits[i]    = (i == n_prefix - 1);
+        }
+        if (llama_decode(lctx, batch) != 0) {
+            LOG_ERR("%s: prefill decode failed\n", __func__);
+            llama_batch_free(batch);
+            return 1;
+        }
+        llama_batch_free(batch);
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const llama_token eos = llama_vocab_eos(vocab);
+
+    // sample the first streaming token from the last prefix position
+    size_t n_out = 0;
+    if (capacity == 0) {
+        LOG_ERR("%s: output buffer is empty\n", __func__);
+        return 1;
+    }
+    {
+        const float * logits = llama_get_logits_ith(lctx, -1);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        if (params->out_step0_logits) {
+            std::memcpy(params->out_step0_logits, logits, n_vocab * sizeof(float));
+        }
+        out_tokens[n_out++] = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    }
+
+    // 3. streaming loop for the remaining positions
+    const bool unlimited = (params->max_tokens <= 0);
+    for (size_t pos = n_prefix; pos < n_tokens; ++pos) {
+        if (out_tokens[n_out - 1] == eos) {
+            break;
+        }
+        if (!unlimited && n_out >= (size_t) params->max_tokens) {
+            break;
+        }
+        if (n_out >= capacity) {
+            LOG_ERR("%s: output buffer too small\n", __func__);
+            return 1;
+        }
+        llama_token next = 0;
+        ret = mtmd_decode_step(ctx, lctx, encoded_embd, (llama_pos) pos, params->seq_id, out_tokens[n_out - 1], &next);
+        if (ret != 0) {
+            LOG_ERR("%s: streaming decode step failed at position %zu\n", __func__, pos);
+            return 1;
+        }
+        out_tokens[n_out++] = next;
+    }
+
+    // drop the trailing EOS
+    if (n_out > 1 && out_tokens[n_out - 1] == eos) {
+        n_out--;
+    }
+
+    *n_out_tokens = n_out;
+    return 0;
 }
 
 bool mtmd_helper_model_can_chat(llama_context * lctx, mtmd_context * mctx) {

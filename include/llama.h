@@ -574,6 +574,9 @@ extern "C" {
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
+    // token embedding tensor of the model (token_embd.weight), or nullptr if not present
+    LLAMA_API const struct ggml_tensor * llama_model_get_tensor_token_embd(const struct llama_model * model);
+
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
