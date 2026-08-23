@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+// keep assertions active in all build types (Release defines NDEBUG)
+#undef NDEBUG
 #include <assert.h>
 
 #include "mtmd.h"
@@ -117,12 +119,36 @@ int main(void) {
             for (size_t j = 0; j < n_tok_orig; j++) {
                 assert(tok_orig[j] == tok_loaded[j]);
             }
-        } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
             const char * id_orig   = mtmd_input_chunk_get_id(chunk);
             const char * id_loaded = mtmd_input_chunk_get_id(loaded);
             printf("    Chunk %zu: loaded id '%s' (orig '%s')\n", i, id_loaded, id_orig);
             assert(id_orig != NULL && id_loaded != NULL);
             assert(strcmp(id_orig, id_loaded) == 0);
+        } else if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+            const char * id_orig   = mtmd_input_chunk_get_id(chunk);
+            const char * id_loaded = mtmd_input_chunk_get_id(loaded);
+            printf("    Chunk %zu: loaded id '%s' (orig '%s')\n", i, id_loaded, id_orig);
+            assert(id_orig != NULL && id_loaded != NULL);
+            assert(strcmp(id_orig, id_loaded) == 0);
+
+            // audio chunks must not carry any text tokens
+            size_t n_text = 123;
+            const llama_token * text = mtmd_input_chunk_get_tokens_text(chunk, &n_text);
+            assert(text == NULL);
+            assert(n_text == 0);
+
+            // serialization is metadata-only: the loaded chunk is a placeholder
+            // and the dual-stream prefix is in-memory only (not serialized)
+            size_t n_pre_orig = 0, n_pre_loaded = 0;
+            const llama_token * pre_orig   = mtmd_input_chunk_get_prefix_tokens(chunk, &n_pre_orig);
+            const llama_token * pre_loaded = mtmd_input_chunk_get_prefix_tokens(loaded, &n_pre_loaded);
+            assert(pre_orig != NULL);   // the in-memory chunk still has its prefix
+            assert(n_pre_orig > 0);
+            assert(pre_loaded == NULL);  // the loaded (placeholder) chunk does not
+            assert(n_pre_loaded == 0);
+            printf("    Chunk %zu: loaded %zu prefix tokens (orig %zu)\n",
+                i, n_pre_loaded, n_pre_orig);
         }
 
         mtmd_input_chunk_free(loaded);

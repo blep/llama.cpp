@@ -91,6 +91,32 @@ MTMD_API int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
                                                bool logits_last,
                                                llama_pos * new_n_past);
 
+// Voxtral realtime ASR (dual-stream) streaming decode.
+//
+// The input chunk must be an audio chunk produced by mtmd_tokenize() from a
+// bitmap that has the streaming prompt prefix attached via
+// mtmd_bitmap_add_prefix_tokens() (e.g. [BOS] + [STREAMING_PAD x (N_LEFT + N_DELAY)]);
+// the prefix is carried in the chunk's audio tokens.
+// The helper then:
+//   1. mtmd_encode_chunk()  -> summed per-position embeddings
+//   2. prefill positions 0..n_prefix-1 (the attached tokens)
+//   3. streaming loop: mtmd_decode_step() for the remaining positions
+// The sampled token stream (excluding the trailing EOS) is written to out_tokens.
+// Returns 0 on success, non-zero on error.
+struct mtmd_helper_voxtral_realtime_params {
+    int32_t    max_tokens;  // maximum number of sampled tokens (0 = unlimited)
+    llama_seq_id seq_id;    // KV cache sequence id
+    float * out_step0_logits;  // optional: receives the logits of the first decode step (n_vocab floats)
+};
+
+MTMD_API int32_t mtmd_helper_eval_voxtral_realtime(
+    mtmd_context * ctx,
+    struct llama_context * lctx,
+    const mtmd_input_chunk * chunk,
+    const struct mtmd_helper_voxtral_realtime_params * params,
+    llama_token * out_tokens,
+    size_t * n_out_tokens);  // in: capacity, out: number of written tokens
+
 typedef int32_t (*mtmd_helper_post_decode_callback)(struct llama_batch batch, void * user_data);
 
 // helper function to decode an image whose embeddings have already been calculated

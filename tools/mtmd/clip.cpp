@@ -1725,6 +1725,12 @@ struct clip_model_loader {
                         hparams.audio_n_fft        = 400;
                         hparams.audio_window_len   = 400;
                         hparams.audio_hop_len      = 160;
+
+                        // realtime mel + streaming framing (data-driven)
+                        get_f32(KEY_A_GLOBAL_LOG_MEL_MAX,    hparams.audio_global_log_mel_max, false);
+                        get_u32(KEY_A_ENC_N_LEFT_PAD,        hparams.audio_enc_n_left_pad,        false);
+                        get_u32(KEY_A_ENC_N_RIGHT_PAD,       hparams.audio_enc_n_right_pad,       false);
+                        get_u32(KEY_A_ENC_SAMPLES_PER_TOKEN, hparams.audio_enc_samples_per_token, false);
                     } break;
                 case PROJECTOR_TYPE_MIMO_AUDIO:
                     {
@@ -3046,6 +3052,8 @@ struct clip_model_loader {
                     // temporal adapter (Linear + GELU + Linear)
                     model.mm_1_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "weight"));
                     model.mm_2_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "weight"));
+                    // mel filterbank [n_freq, n_mel] for the realtime preprocessor
+                    hparams.mel_filters = get_vector(TN_MEL_FILTERS);
                 } break;
             case PROJECTOR_TYPE_MUSIC_FLAMINGO:
                 {

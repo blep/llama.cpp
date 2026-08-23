@@ -136,6 +136,9 @@ MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_in
 // whether the current model use M-RoPE for llama_decode
 MTMD_API bool mtmd_decode_use_mrope(const mtmd_context * ctx);
 
+// whether the current model uses the dual-stream decode path (Voxtral realtime ASR)
+MTMD_API bool mtmd_decode_use_dual_stream(const mtmd_context * ctx);
+
 // whether the current model supports vision input
 MTMD_API bool mtmd_support_vision(const mtmd_context * ctx);
 
@@ -172,6 +175,10 @@ MTMD_API uint32_t              mtmd_bitmap_get_ny     (const mtmd_bitmap * bitma
 MTMD_API const unsigned char * mtmd_bitmap_get_data   (const mtmd_bitmap * bitmap);
 MTMD_API size_t                mtmd_bitmap_get_n_bytes(const mtmd_bitmap * bitmap);
 MTMD_API bool                  mtmd_bitmap_is_audio   (const mtmd_bitmap * bitmap);
+// attach the dual-stream prompt prefix tokens (e.g. [BOS] + [STREAMING_PAD] x N) to the bitmap.
+// the tokens are carried into the audio chunk by mtmd_tokenize() and summed
+// with the audio embeddings by mtmd_encode_chunk().
+MTMD_API void                  mtmd_bitmap_add_prefix_tokens(mtmd_bitmap * bitmap, const llama_token * tokens, size_t n_tokens);
 MTMD_API void                  mtmd_bitmap_free       (mtmd_bitmap * bitmap);
 // bitmap ID is optional, but useful for KV cache tracking
 // these getters/setters are dedicated functions, so you can for example calculate the hash of the image based on mtmd_bitmap_get_data()
@@ -224,6 +231,8 @@ MTMD_API void                     mtmd_input_chunks_free(mtmd_input_chunks * chu
 // it will be freed along with mtmd_input_chunks
 MTMD_API enum mtmd_input_chunk_type mtmd_input_chunk_get_type        (const mtmd_input_chunk * chunk);
 MTMD_API const llama_token *        mtmd_input_chunk_get_tokens_text (const mtmd_input_chunk * chunk, size_t * n_tokens_output);
+// the dual-stream prompt prefix of an audio chunk (e.g. [BOS] + [STREAMING_PAD] x N)
+MTMD_API const llama_token *        mtmd_input_chunk_get_prefix_tokens(const mtmd_input_chunk * chunk, size_t * n_tokens_output);
 MTMD_API const mtmd_image_tokens *  mtmd_input_chunk_get_tokens_image(const mtmd_input_chunk * chunk);
 MTMD_API size_t                     mtmd_input_chunk_get_n_tokens    (const mtmd_input_chunk * chunk);
 // returns nullptr for ID on text chunk
@@ -311,6 +320,20 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
+
+// decode a single streaming step for a dual-stream model (Voxtral realtime ASR).
+// the input embedding for position `pos` is built as:
+//   token_embd(tok) + encoded_embd[pos]   (dual-stream summation)
+// the KV cache persists across calls (positions must be increasing).
+// the greedy-sampled token is written to *out_token.
+// returns 0 on success, 1 on error or if the model is not dual-stream.
+MTMD_API int32_t mtmd_decode_step(mtmd_context * ctx,
+                                  struct llama_context * lctx,
+                                  const float * encoded_embd,
+                                  llama_pos pos,
+                                  llama_seq_id seq_id,
+                                  llama_token tok,
+                                  llama_token * out_token);
 
 
 // batch encoding API
