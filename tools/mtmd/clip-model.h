@@ -129,6 +129,11 @@ struct clip_hparams {
     int32_t audio_max_pos_emb          = 0;
     int32_t audio_proj_window_size     = 0;
     int32_t audio_proj_downsample_rate = 0;
+    // Voxtral realtime: mel + streaming framing (data-driven from the mmproj)
+    float   audio_global_log_mel_max = 0.0f;   // post-log clamp at max - 8
+    int32_t audio_enc_n_left_pad  = 0;         // in tokens (32)
+    int32_t audio_enc_n_right_pad = 0;         // in tokens (17)
+    int32_t audio_enc_samples_per_token = 0;   // 1280
     int32_t audio_proj_head_count      = 0;
 
     // audio-to-mel preprocessor params

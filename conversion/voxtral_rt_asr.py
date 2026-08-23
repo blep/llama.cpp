@@ -145,6 +145,10 @@ class VoxtralRealtimeAsrEncoderModel(MmprojModel):
         rope = self.find_aparam(["rope_parameters"], optional=True) or {}
         self.gguf_writer.add_float32("clip.audio.rope.freq_base", float(rope.get("rope_theta", 1.0e6)))
         self.gguf_writer.add_float32("clip.audio.global_log_mel_max", 1.5)
+        # streaming framing: 32/17 pad tokens x 1280 samples (realtime ASR)
+        self.gguf_writer.add_uint32("clip.audio.encoder.n_left_pad_tokens", 32)
+        self.gguf_writer.add_uint32("clip.audio.encoder.n_right_pad_tokens", 17)
+        self.gguf_writer.add_uint32("clip.audio.encoder.samples_per_token", 1280)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         # the CPU conv path rejects bf16 weights (mul_mat(im2col_f32, bf16))

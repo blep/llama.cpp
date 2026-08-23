@@ -92,6 +92,10 @@
 #define KEY_A_ATTN_WINDOW_SIZE     "clip.audio.window_size"          // mimo-audio-tokenizer: sliding-window radius
 #define KEY_A_LOCAL_BLOCK_COUNT    "clip.audio.local_block_count"    // mimo-v2.5: input_local_transformer layer count
 #define KEY_A_LOCAL_GROUP_SIZE     "clip.audio.local_group_size"     // mimo-v2.5: input_local_transformer grouping size
+#define KEY_A_GLOBAL_LOG_MEL_MAX    "clip.audio.global_log_mel_max"
+#define KEY_A_ENC_N_LEFT_PAD        "clip.audio.encoder.n_left_pad_tokens"
+#define KEY_A_ENC_N_RIGHT_PAD       "clip.audio.encoder.n_right_pad_tokens"
+#define KEY_A_ENC_SAMPLES_PER_TOKEN "clip.audio.encoder.samples_per_token"
 // audio generation (gen-audio)-specific
 #define KEY_GEN_AUDIO_PROJ_TYPE    "clip.gen.audio.projector_type" // for models with mixed modalities
 // name of the weight variant, for settings that are not in the checkpoint

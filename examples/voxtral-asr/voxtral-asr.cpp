@@ -17,19 +17,17 @@
 //
 // Usage: llama-voxtral-asr -m voxtral-realtime-asr-2602-bf16.gguf -mv mmproj-voxtral-realtime-asr-2602-bf16.gguf -f input.wav [options]
 
-#include "clip.h"
 #include "common.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
-#include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <cmath>
 #include <cstdarg>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -39,25 +37,9 @@
 // constants (must match the GGUF metadata / voxtral.cpp)
 // ---------------------------------------------------------------------------
 
-static constexpr int32_t VOXTRAL_SAMPLE_RATE        = 16000;
-static constexpr int32_t VOXTRAL_NUM_MEL_BINS       = 128;
-static constexpr int32_t VOXTRAL_HOP_LENGTH         = 160;
-static constexpr int32_t VOXTRAL_WINDOW_SIZE        = 400;
-static constexpr int32_t VOXTRAL_N_FFT              = 400;
-static constexpr int32_t VOXTRAL_N_FREQ             = VOXTRAL_N_FFT / 2 + 1;  // 201
-static constexpr float   VOXTRAL_GLOBAL_LOG_MEL_MAX = 1.5f;
-static constexpr int32_t VOXTRAL_DEC_DIM           = 3072;
-static constexpr int32_t VOXTRAL_DOWNSAMPLE_FACTOR = 4;
-
-static constexpr int32_t VOXTRAL_N_LEFT_PAD_TOKENS        = 32;
-static constexpr int32_t VOXTRAL_N_DELAY_TOKENS           = 6;
-static constexpr int32_t VOXTRAL_N_RIGHT_PAD_TOKENS       = 17;
-static constexpr int32_t VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK = 1280;
-
-static constexpr int32_t VOXTRAL_TOKEN_BOS           = 1;
-static constexpr int32_t VOXTRAL_TOKEN_EOS           = 2;
-
-static constexpr double VOXTRAL_PI = 3.14159265358979323846;
+static constexpr int32_t VOXTRAL_SAMPLE_RATE       = 16000;
+static constexpr int32_t VOXTRAL_N_LEFT_PAD_TOKENS = 32;
+static constexpr int32_t VOXTRAL_N_DELAY_TOKENS    = 6;
 
 // ---------------------------------------------------------------------------
 // logging (same style as the rest of llama.cpp tools)
@@ -195,120 +177,6 @@ static bool load_wav_file(const std::string & path, std::vector<float> & audio_o
 // ---------------------------------------------------------------------------
 
 // PyTorch reflect padding (mirror without repeating the edge sample)
-static inline int32_t reflect_idx(int32_t i, int32_t n) {
-    if (i >= 0 && i < n) {
-        return i;
-    }
-    if (n <= 1) {
-        return 0;
-    }
-    if (i < 0) {
-        int32_t x      = -i;
-        int32_t period = 2 * (n - 1);
-        x %= period;
-        return x < n ? x : period - x;
-    }
-    int32_t x      = i - (n - 1);
-    int32_t period = 2 * (n - 1);
-    x %= period;
-    return x < n ? n - 1 - x : x - (n - 1);
-}
-
-static void compute_mel_spectrogram(const float * audio,
-                                    int32_t       n_samples,
-                                    const float * mel_filters,  // [n_freq, n_mel]
-                                    const float * hann_window,  // [window_size]
-                                    float *       mel_out,      // [n_mel, n_frames]
-                                    int32_t *     out_n_frames) {
-    const int32_t n_stft_frames = n_samples / VOXTRAL_HOP_LENGTH + 1;
-    const int32_t n_frames      = n_stft_frames - 1;  // drop last frame, matching Python [:-1]
-    *out_n_frames               = n_frames;
-
-    const int32_t pad = VOXTRAL_N_FFT / 2;
-
-    if (n_frames <= 0) {
-        return;
-    }
-
-    // reflect padding once (center=True, pad_mode="reflect")
-    const int32_t      centered_len = n_samples + 2 * pad;
-    std::vector<float> centered((size_t) centered_len, 0.0f);
-    for (int32_t i = 0; i < centered_len; ++i) {
-        const int32_t src    = i - pad;
-        centered[(size_t) i] = audio[(size_t) reflect_idx(src, n_samples)];
-    }
-
-    std::vector<float> windowed((size_t) VOXTRAL_N_FFT);
-    std::vector<float> power((size_t) VOXTRAL_N_FREQ);
-    std::vector<float> mel_accum((size_t) VOXTRAL_NUM_MEL_BINS);
-
-    for (int32_t frame = 0; frame < n_frames; ++frame) {
-        const int32_t start     = frame * VOXTRAL_HOP_LENGTH;
-        const float * frame_ptr = centered.data() + (size_t) start;
-
-        for (int32_t i = 0; i < VOXTRAL_N_FFT; ++i) {
-            windowed[(size_t) i] = frame_ptr[(size_t) i] * hann_window[(size_t) i];
-        }
-
-        // DFT
-        for (int32_t k = 0; k < VOXTRAL_N_FREQ; ++k) {
-            const float angle_k = 2.0f * (float) VOXTRAL_PI * (float) k;
-            float       re = 0.0f, im = 0.0f;
-            for (int32_t i = 0; i < VOXTRAL_N_FFT; ++i) {
-                const float angle = angle_k * (float) i / (float) VOXTRAL_N_FFT;
-                re += windowed[(size_t) i] * cosf(angle);
-                im -= windowed[(size_t) i] * sinf(angle);
-            }
-            power[(size_t) k] = re * re + im * im;
-        }
-
-        // mel filterbank
-        std::fill(mel_accum.begin(), mel_accum.end(), 0.0f);
-        for (int32_t k = 0; k < VOXTRAL_N_FREQ; ++k) {
-            const float * w  = mel_filters + (size_t) k * (size_t) VOXTRAL_NUM_MEL_BINS;
-            const float   pk = power[(size_t) k];
-            for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; ++m) {
-                mel_accum[(size_t) m] += w[m] * pk;
-            }
-        }
-
-        for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; ++m) {
-            float val                                                = mel_accum[(size_t) m];
-            val                                                      = std::max(val, 1e-10f);
-            val                                                      = log10f(val);
-            val                                                      = std::max(val, VOXTRAL_GLOBAL_LOG_MEL_MAX - 8.0f);
-            val                                                      = (val + 4.0f) / 4.0f;
-            mel_out[(size_t) m * (size_t) n_frames + (size_t) frame] = val;
-        }
-    }
-}
-
-static void compute_mel_even(const float *              samples,
-                             int32_t                    n_samples,
-                             const std::vector<float> & mel_filters,
-                             const std::vector<float> & hann_window,
-                             std::vector<float> &       mel_data,
-                             int32_t &                  n_frames) {
-    const int32_t max_frames = n_samples / VOXTRAL_HOP_LENGTH + 1;
-    // NOTE: compute_mel_spectrogram writes with row stride n_frames, so the
-    // buffer must be allocated with n_frames columns per row, NOT max_frames.
-    // (allocating max_frames and dumping n_mel*n_frames reads misaligned rows)
-    mel_data.assign((size_t) VOXTRAL_NUM_MEL_BINS * (max_frames - 1), 0.0f);
-    n_frames = 0;
-    compute_mel_spectrogram(samples, n_samples, mel_filters.data(), hann_window.data(), mel_data.data(), &n_frames);
-    if (n_frames % 2 != 0) {
-        for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; ++m) {
-            memmove(mel_data.data() + (size_t) m * (n_frames - 1), mel_data.data() + (size_t) m * n_frames + 1,
-                    (size_t) (n_frames - 1) * sizeof(float));
-        }
-        n_frames -= 1;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GGUF tensor reading (encoder + adapter + mel filters), dequantized to F32
-// ---------------------------------------------------------------------------
-
 struct gguf_tensor {
     enum ggml_type       type = GGML_TYPE_F32;
     std::vector<int64_t> ne;
@@ -445,73 +313,6 @@ static bool load_gguf_tensor_f32(const char * path, const char * name, gguf_tens
 // hann window
 // ---------------------------------------------------------------------------
 
-static void compute_hann_window(std::vector<float> & hann) {
-    hann.resize(VOXTRAL_WINDOW_SIZE);
-    // match torch.hann_window(W, periodic=True): divide by W, not W-1
-    for (int32_t i = 0; i < VOXTRAL_WINDOW_SIZE; ++i) {
-        hann[(size_t) i] = 0.5f * (1.0f - cosf(2.0f * (float) VOXTRAL_PI * (float) i / (float) VOXTRAL_WINDOW_SIZE));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// causal conv1d dims + graph (matches voxtral.cpp)
-// ---------------------------------------------------------------------------
-
-struct conv1d_dims {
-    int32_t pad_left   = 0;
-    int32_t pad_right  = 0;
-    int32_t padded_len = 0;
-    int32_t out_len    = 0;
-};
-
-static conv1d_dims compute_causal_conv1d_dims(int32_t in_len, int32_t kernel_size, int32_t stride) {
-    conv1d_dims   d;
-    const int32_t padding_total = kernel_size - stride;
-    const float   n_frames      = (float) (in_len - kernel_size + padding_total) / (float) stride + 1.0f;
-    const int32_t target_length = ((int32_t) ceilf(n_frames) - 1) * stride + (kernel_size - padding_total);
-    d.pad_left                  = padding_total;
-    d.pad_right                 = std::max(0, target_length - in_len);
-    d.padded_len                = in_len + d.pad_left + d.pad_right;
-    d.out_len                   = (d.padded_len - kernel_size) / stride + 1;
-    return d;
-}
-
-static int32_t mel_frames_to_enc_tokens(int32_t n_frames) {
-    const conv1d_dims d0    = compute_causal_conv1d_dims(n_frames, 3, 1);
-    const conv1d_dims d1    = compute_causal_conv1d_dims(d0.out_len, 3, 2);
-    const int32_t     trunc = d1.out_len % VOXTRAL_DOWNSAMPLE_FACTOR;
-    return d1.out_len - trunc;
-}
-
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
-struct voxtral_model_weights {
-    ggml_context * ctx      = nullptr;  // holds the token embedding tensor
-    ggml_tensor *  tok_embd = nullptr;
-
-    int32_t token_streaming_pad  = 32;  // [STREAMING_PAD]
-    int32_t token_streaming_word = 33;  // [STREAMING_WORD]
-
-    std::vector<float> mel_filters_cpu;  // [n_freq, n_mel] F32
-    std::vector<float> hann_window;
-};
-
-// mel filterbank + hann window for the STFT (the filterbank lives in the mmproj)
-static bool load_mel_filters(const char * mmproj_path, voxtral_model_weights & W) {
-    gguf_tensor t;
-    if (!load_gguf_tensor_f32(mmproj_path, "a.mel_filters", t)) {
-        log_error("a.mel_filters tensor not found in %s", mmproj_path);
-        return false;
-    }
-    W.mel_filters_cpu = t.f32;
-    compute_hann_window(W.hann_window);
-    return true;
-}
-
-// token embedding lives in the main (text) GGUF; load it as F32
-// read a uint32 metadata key from the main GGUF (missing -> default)
 static uint32_t load_gguf_uint32(const char * path, const char * key, uint32_t fallback) {
     gguf_init_params iparams = { /*.no_alloc =*/true, /*.ctx =*/nullptr };
     gguf_context *   ctx     = gguf_init_from_file(path, iparams);
@@ -527,29 +328,6 @@ static uint32_t load_gguf_uint32(const char * path, const char * key, uint32_t f
     return val;
 }
 
-static bool load_token_embd(const char * main_path, voxtral_model_weights & W) {
-    gguf_tensor t;
-    if (!load_gguf_tensor_f32(main_path, "token_embd.weight", t)) {
-        log_error("token_embd.weight not found in %s", main_path);
-        return false;
-    }
-    W.token_streaming_pad  = (int32_t) load_gguf_uint32(main_path, "voxtral_rt_asr.streaming.streaming_pad_token_id",  32);
-    W.token_streaming_word = (int32_t) load_gguf_uint32(main_path, "voxtral_rt_asr.streaming.streaming_word_token_id", 33);
-    ggml_init_params p = { 4ull << 30, nullptr, false };
-    W.ctx              = ggml_init(p);
-    if (!W.ctx) {
-        log_error("failed to init token-embd context");
-        return false;
-    }
-    W.tok_embd = ggml_new_tensor(W.ctx, GGML_TYPE_F32, (int) t.ne.size(), t.ne.data());
-    if (!W.tok_embd) {
-        log_error("failed to create token_embd tensor");
-        return false;
-    }
-    memcpy(W.tok_embd->data, t.f32.data(), t.f32.size() * sizeof(float));
-    return true;
-}
-
 static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s -m model.gguf -mv mmproj.gguf -f input.wav [options]\n", argv0);
     fprintf(stderr, "  -m, --model PATH        main GGUF (text decoder, arch voxtral_rt_asr)\n");
@@ -557,7 +335,7 @@ static void usage(const char * argv0) {
     fprintf(stderr, "  -f, --file PATH         16 kHz mono PCM16 WAV\n");
     fprintf(stderr, "  -n, --max-tokens N      max decoder tokens (0 = to end of audio)\n");
     fprintf(stderr, "  -t, --threads N         CPU threads for the encoder/decoder\n");
-    fprintf(stderr, "  -ngl, --gpu-layers N    decoder layers on the GPU/iGPU (0 = CPU only)\n");
+    fprintf(stderr, "  -ngl, --gpu-layers N    decoder layers on the GPU/iGPU (0 = CPU only; also offloads the audio encoder mmproj when > 0)\n");
     fprintf(stderr, "  -v, --verbose           verbose logging\n");
     fprintf(stderr, "  -h, --help              show this help\n");
 }
@@ -569,9 +347,7 @@ int main(int argc, char ** argv) {
     std::string mmproj_path;
     std::string audio_path;
     std::string dump_logits_bin;
-    std::string dump_mel;
-    std::string dump_adapter;
-    std::string adapter_in;
+    std::string dump_embd;
     std::string dump_tensor;
     int32_t     max_tokens   = 0;
     int         n_threads    = 4;
@@ -615,24 +391,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             dump_logits_bin = argv[i];
-        } else if (arg == "--dump-mel") {
+        } else if (arg == "--dump-embd") {
             if (++i >= argc) {
                 log_error("missing value for %s", arg.c_str());
                 return 1;
             }
-            dump_mel = argv[i];
-        } else if (arg == "--dump-adapter") {
-            if (++i >= argc) {
-                log_error("missing value for %s", arg.c_str());
-                return 1;
-            }
-            dump_adapter = argv[i];
-        } else if (arg == "--adapter-in") {
-            if (++i >= argc) {
-                log_error("missing value for %s", arg.c_str());
-                return 1;
-            }
-            adapter_in = argv[i];
+            dump_embd = argv[i];
         } else if (arg == "--dump-tensor") {
             if (++i >= argc) {
                 log_error("missing value for %s", arg.c_str());
@@ -711,14 +475,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const int32_t       n_embd  = llama_model_n_embd(model);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
-
-    if (n_embd != VOXTRAL_DEC_DIM) {
-        log_error("model n_embd %d != expected %d", n_embd, VOXTRAL_DEC_DIM);
-        return 1;
-    }
 
     // ---------------- load audio ----------------
     std::vector<float> audio;
@@ -726,245 +484,112 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // ---------------- load the audio tower via mtmd (mmproj GGUF) ----------------
-    clip_context_params clip_params = {};
-    clip_params.use_gpu             = false;  // encoder on CPU
-    clip_params.flash_attn_type     = CLIP_FLASH_ATTN_TYPE_DISABLED;
-    clip_params.warmup              = false;
-    clip_params.no_alloc            = false;
-    const auto clip_res             = clip_init(mmproj_path.c_str(), clip_params);
-    clip_ctx * ctx_a                = clip_res.ctx_a;
-    if (!ctx_a) {
+    // ---------------- realtime ASR via mtmd (dual-stream) ----------------
+    mtmd_context_params mctx_params = mtmd_context_params_default();
+    mctx_params.use_gpu   = n_gpu_layers > 0;  // offload the audio encoder (mmproj) to the GPU when the decoder is offloaded (-ngl > 0)
+    mctx_params.n_threads = n_threads;
+    mtmd_context * mctx   = mtmd_init_from_file(mmproj_path.c_str(), model, mctx_params);
+    if (!mctx) {
         log_error("failed to load mmproj %s", mmproj_path.c_str());
         return 1;
     }
 
-    // token embedding lives in the main (text) GGUF
-    voxtral_model_weights W;
-    if (!load_token_embd(model_path.c_str(), W)) {
-        return 1;
-    }
-    // mel filterbank + hann window come from the mmproj
-    if (!load_mel_filters(mmproj_path.c_str(), W)) {
-        return 1;
-    }
-
-    // streaming padding (matching Python pad_audio_streaming)
-    const int32_t n_raw     = (int32_t) audio.size();
-    const int32_t align_pad = (VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK - (n_raw % VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK)) %
-                              VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
-    const int32_t right_pad = align_pad + VOXTRAL_N_RIGHT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
-    const int32_t left_pad  = VOXTRAL_N_LEFT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
-
-    std::vector<float> padded((size_t) left_pad + n_raw + right_pad, 0.0f);
-    memcpy(padded.data() + left_pad, audio.data(), n_raw * sizeof(float));
-    log_info("padded audio: %d samples (left=%d, right=%d)", (int) padded.size(), left_pad, right_pad);
-
-    // mel spectrogram
-    int32_t            n_frames = 0;
-    std::vector<float> mel_data;
-    compute_mel_even(padded.data(), (int32_t) padded.size(), W.mel_filters_cpu, W.hann_window, mel_data, n_frames);
-    log_info("mel spectrogram: %d frames", n_frames);
-    if (!dump_mel.empty()) {
-        FILE * fd = fopen(dump_mel.c_str(), "wb");
-        if (fd) {
-            const int32_t n = VOXTRAL_NUM_MEL_BINS * n_frames;
-            fwrite(&n, sizeof(int32_t), 1, fd);
-            fwrite(mel_data.data(), sizeof(float), n, fd);
-            fclose(fd);
-            log_info("wrote mel to %s", dump_mel.c_str());
-        }
-    }
-
-    const int32_t total_enc_tokens = mel_frames_to_enc_tokens(n_frames);
-    if (total_enc_tokens <= 0) {
-        log_error("audio too short to produce encoder tokens");
-        return 1;
-    }
-    const int32_t dec_seq = total_enc_tokens / VOXTRAL_DOWNSAMPLE_FACTOR;
-    log_info("encoder tokens: %d, decoder audio positions: %d", total_enc_tokens, dec_seq);
-
-    // ---- audio tower via mtmd: mel -> causal encoder -> temporal adapter ----
-    std::vector<float> audio_emb((size_t) VOXTRAL_DEC_DIM * dec_seq, 0.0f);
-    {
-        // mel_data is [n_mel, n_frames] (frame contiguous within each bin)
-        std::vector<float> out;
-        if (!clip_audio_encode(ctx_a, n_threads, mel_data.data(), VOXTRAL_NUM_MEL_BINS, n_frames, out)) {
-            log_error("mtmd audio encode failed");
-            return 1;
-        }
-        if ((int32_t) out.size() != VOXTRAL_DEC_DIM * dec_seq) {
-            log_error("mtmd output size %zu != expected %d", out.size(), VOXTRAL_DEC_DIM * dec_seq);
-            return 1;
-        }
-        // mtmd output is the adapter result [dec_dim, dec_seq] (ne0 = dec_dim,
-        // flat [d + s*dec_dim]); transpose to [dec_seq, dec_dim] (token-major)
-        for (int32_t s = 0; s < dec_seq; ++s) {
-            for (int32_t d = 0; d < VOXTRAL_DEC_DIM; ++d) {
-                audio_emb[(size_t) s * VOXTRAL_DEC_DIM + d] = out[(size_t) d + (size_t) s * VOXTRAL_DEC_DIM];
-            }
-        }
-    }
-    log_info("adapter done: %d audio embeddings", dec_seq);
-
-    // debug: optionally override the adapter output with an external file
-    if (!adapter_in.empty()) {
-        FILE * fd = fopen(adapter_in.c_str(), "rb");
-        if (!fd) {
-            log_error("cannot open adapter input: %s", adapter_in.c_str());
-            return 1;
-        }
-        int32_t n = 0;
-        if (fread(&n, sizeof(int32_t), 1, fd) != 1 || n != (int32_t) audio_emb.size()) {
-            log_error("adapter input size mismatch: expected %d, got %d", (int) audio_emb.size(), n);
-            fclose(fd);
-            return 1;
-        }
-        if (fread(audio_emb.data(), sizeof(float), n, fd) != (size_t) n) {
-            log_error("failed to read adapter input");
-            fclose(fd);
-            return 1;
-        }
-        fclose(fd);
-        log_info("overrode adapter output from %s", adapter_in.c_str());
-    }
-
-    if (!dump_adapter.empty()) {
-        FILE * fd = fopen(dump_adapter.c_str(), "wb");
-        if (fd) {
-            const int32_t n = dec_seq * VOXTRAL_DEC_DIM;
-            fwrite(&n, sizeof(int32_t), 1, fd);
-            fwrite(audio_emb.data(), sizeof(float), n, fd);
-            fclose(fd);
-            log_info("wrote adapter output to %s", dump_adapter.c_str());
-        }
-    }
-
-    // ---- DSM decode loop via llama.cpp ----
-    // prompt: [BOS] + [STREAMING_PAD] * (N_LEFT + N_DELAY)
+    // streaming prompt prefix: [BOS] + [STREAMING_PAD] x (N_LEFT + N_DELAY)
+    const llama_token streaming_pad = (llama_token) load_gguf_uint32(
+        model_path.c_str(), "voxtral_rt_asr.streaming.streaming_pad_token_id", 32);
+    const llama_token bos = llama_vocab_bos(vocab);
     std::vector<llama_token> prompt_ids;
-    prompt_ids.push_back(VOXTRAL_TOKEN_BOS);
+    prompt_ids.push_back(bos);
     for (int32_t i = 0; i < VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS; ++i) {
-        prompt_ids.push_back(W.token_streaming_pad);
+        prompt_ids.push_back(streaming_pad);
     }
-    const int32_t L = (int32_t) prompt_ids.size();  // 39
 
-    if (L > dec_seq) {
-        log_error("prompt length %d exceeds audio tokens %d", L, dec_seq);
+    // audio bitmap with the per-position dual-stream prompt prefix attached
+    mtmd_bitmap * bitmap = mtmd_bitmap_init_from_audio(audio.size(), audio.data());
+    if (!bitmap) {
+        log_error("failed to create audio bitmap");
+        mtmd_free(mctx);
         return 1;
     }
+    mtmd_bitmap_add_prefix_tokens(bitmap, prompt_ids.data(), prompt_ids.size());
 
-    auto decode_batch = [&](const std::vector<float> & emb, const std::vector<int64_t> & pos) -> bool {
-        const int   n     = (int) emb.size() / VOXTRAL_DEC_DIM;
-        llama_batch batch = llama_batch_init(n, VOXTRAL_DEC_DIM, 1);
-        batch.n_tokens    = n;
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < VOXTRAL_DEC_DIM; ++j) {
-                batch.embd[(size_t) i * VOXTRAL_DEC_DIM + j] = emb[(size_t) i * VOXTRAL_DEC_DIM + j];
-            }
-            batch.pos[i]       = pos[i];
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = (i == n - 1);  // logits only for the last token
-        }
-        bool ok = llama_decode(ctx_dec, batch) == 0;
-        llama_batch_free(batch);
-        if (verbose_logging) {
-            llama_memory_t mem = llama_get_memory(ctx_dec);
-            fprintf(stderr, "DBG decode n=%d kv pos=[%d..%d]\n", n, (int) llama_memory_seq_pos_min(mem, 0),
-                    (int) llama_memory_seq_pos_max(mem, 0));
-        }
-        return ok;
-    };
-
-    // token embedding lookup (CPU): [n_vocab, n_embd]
-    const float * tok_embd_w = (const float *) W.tok_embd->data;
-
-    // helper: build input embedding for position i (token + audio)
-    auto build_input_emb = [&](llama_token tok, int32_t pos, float * out) -> void {
-        const float * te = tok_embd_w + (int64_t) tok * VOXTRAL_DEC_DIM;
-        const float * ae = audio_emb.data() + (int64_t) pos * VOXTRAL_DEC_DIM;
-        for (int j = 0; j < VOXTRAL_DEC_DIM; ++j) {
-            out[j] = te[j] + ae[j];
-        }
-    };
-
-    // prefill: positions 0..L-2 (L-1 tokens), then one step with the last prefix token
-    {
-        std::vector<float>   emb((size_t) (L - 1) * VOXTRAL_DEC_DIM);
-        std::vector<int64_t> pos(L - 1);
-        for (int32_t i = 0; i < L - 1; ++i) {
-            build_input_emb(prompt_ids[i], i, emb.data() + (size_t) i * VOXTRAL_DEC_DIM);
-            pos[i] = i;
-        }
-        if (!decode_batch(emb, pos)) {
-            log_error("decoder prefill failed");
-            return 1;
-        }
+    // tokenize: media marker + audio bitmap -> one audio chunk
+    const char * marker = mtmd_default_marker();
+    mtmd_input_text input_text = { marker, strlen(marker), true, true };
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    const mtmd_bitmap * bitmaps[] = { bitmap };
+    if (mtmd_tokenize(mctx, chunks, &input_text, bitmaps, 1) != 0) {
+        log_error("mtmd_tokenize failed");
+        mtmd_bitmap_free(bitmap);
+        mtmd_input_chunks_free(chunks);
+        mtmd_free(mctx);
+        return 1;
     }
+    mtmd_bitmap_free(bitmap);
 
-    std::vector<float>       logits((size_t) n_vocab);
-    std::vector<llama_token> out_tokens;
-    llama_token              token = 0;
-
-    {
-        // one step with the last prefix token at position L-1
-        std::vector<float> emb(VOXTRAL_DEC_DIM);
-        build_input_emb(prompt_ids[L - 1], L - 1, emb.data());
-        std::vector<int64_t> pos = { L - 1 };
-        if (!decode_batch(emb, pos)) {
-            log_error("decoder step failed");
-            return 1;
-        }
-        const float * lg = llama_get_logits_ith(ctx_dec, 0);
-        memcpy(logits.data(), lg, n_vocab * sizeof(float));
-        if (!dump_logits_bin.empty()) {
-            FILE * fd = fopen(dump_logits_bin.c_str(), "wb");
-            if (fd) {
-                fwrite(logits.data(), sizeof(float), n_vocab, fd);
-                fclose(fd);
-                log_info("wrote step-0 logits to %s", dump_logits_bin.c_str());
-            }
-        }
-        const size_t imax = std::max_element(logits.begin(), logits.end()) - logits.begin();
-        token             = (llama_token) imax;
-        out_tokens.push_back(token);
-        log_info("first token: %d", token);
-    }
-
-    const bool unlimited = (max_tokens <= 0);
-    const auto t_decode  = std::chrono::steady_clock::now();
-
-    for (int32_t pos = L; pos < dec_seq && (unlimited || (int32_t) out_tokens.size() < max_tokens); ++pos) {
-        if (token == VOXTRAL_TOKEN_EOS) {
+    // find the audio chunk
+    const mtmd_input_chunk * chunk = nullptr;
+    for (size_t i = 0; i < mtmd_input_chunks_size(chunks); ++i) {
+        const mtmd_input_chunk * c = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(c) == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+            chunk = c;
             break;
         }
+    }
+    if (!chunk) {
+        log_error("no audio chunk produced");
+        mtmd_input_chunks_free(chunks);
+        mtmd_free(mctx);
+        return 1;
+    }
+    log_info("audio chunk: %zu positions, %zu prefix tokens",
+             mtmd_input_chunk_get_n_tokens(chunk), prompt_ids.size());
 
-        std::vector<float> emb(VOXTRAL_DEC_DIM);
-        build_input_emb(token, pos, emb.data());
-        std::vector<int64_t> posv = { pos };
-        if (!decode_batch(emb, posv)) {
-            log_error("decoder step %d failed", pos);
-            return 1;
-        }
-        const float * lg = llama_get_logits_ith(ctx_dec, 0);
-        memcpy(logits.data(), lg, n_vocab * sizeof(float));
-        const size_t imax = std::max_element(logits.begin(), logits.end()) - logits.begin();
-        token             = (llama_token) imax;
-        out_tokens.push_back(token);
-        if (verbose_logging && (pos < 45 || pos % 10 == 0)) {
-            fprintf(stderr, "step pos=%d tok=%d p_pad=%.3f p_word=%.3f p_eos=%.3f\n", pos, (int) token,
-                    logits[W.token_streaming_pad], logits[W.token_streaming_word], logits[VOXTRAL_TOKEN_EOS]);
+    if (!dump_embd.empty()) {
+        if (mtmd_encode_chunk(mctx, chunk) != 0) {
+            log_error("mtmd_encode_chunk failed");
+        } else {
+            float * embd = mtmd_get_output_embd(mctx);
+            const size_t n_embd_v = (size_t) mtmd_input_chunk_get_n_tokens(chunk) * (size_t) llama_model_n_embd_inp(model);
+            FILE * fd = fopen(dump_embd.c_str(), "wb");
+            if (fd) {
+                const int32_t n = (int32_t) n_embd_v;
+                fwrite(&n, sizeof(int32_t), 1, fd);
+                fwrite(embd, sizeof(float), n_embd_v, fd);
+                fclose(fd);
+                log_info("wrote encoded embeddings to %s", dump_embd.c_str());
+            }
         }
     }
 
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_decode).count();
-    log_info("decode: %d steps, %.1f ms (%.1f ms/step)", (int) out_tokens.size() - 1, ms,
-             out_tokens.size() > 1 ? ms / (out_tokens.size() - 1) : 0.0);
+    // run the realtime ASR decode (encode + prefill + streaming loop)
+    std::vector<llama_token> out_tokens(mtmd_input_chunk_get_n_tokens(chunk));
+    size_t n_out = out_tokens.size();
+    std::vector<float> step0_logits;
+    mtmd_helper_voxtral_realtime_params hparams = {};
+    hparams.max_tokens       = max_tokens;
+    hparams.seq_id           = 0;
+    if (!dump_logits_bin.empty()) {
+        step0_logits.resize((size_t) n_vocab);
+        hparams.out_step0_logits = step0_logits.data();
+    }
+    const int32_t res = mtmd_helper_eval_voxtral_realtime(
+        mctx, ctx_dec, chunk, &hparams, out_tokens.data(), &n_out);
+    if (res != 0) {
+        log_error("realtime ASR decode failed (res=%d)", res);
+        mtmd_input_chunks_free(chunks);
+        mtmd_free(mctx);
+        return 1;
+    }
+    out_tokens.resize(n_out);
 
-    // remove trailing EOS
-    if (!out_tokens.empty() && out_tokens.back() == VOXTRAL_TOKEN_EOS) {
-        out_tokens.pop_back();
+    if (!dump_logits_bin.empty()) {
+        FILE * fd = fopen(dump_logits_bin.c_str(), "wb");
+        if (fd) {
+            fwrite(step0_logits.data(), sizeof(float), n_vocab, fd);
+            fclose(fd);
+            log_info("wrote step-0 logits to %s", dump_logits_bin.c_str());
+        }
     }
 
     // decode tokens to text (Tekken)
@@ -986,7 +611,8 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n");
 
     // cleanup
-    ggml_free(W.ctx);
+    mtmd_input_chunks_free(chunks);
+    mtmd_free(mctx);
     llama_free(ctx_dec);
     llama_model_free(model);
     llama_backend_free();

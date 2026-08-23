@@ -162,22 +162,29 @@ struct mtmd_bitmap {
         : nx(nx), ny(ny), is_audio(false) {
         if (data) {
             size_t data_size = (size_t)nx * ny * 3;
-            this->data.resize(data_size);
-            std::memcpy(this->data.data(), data, data_size);
+            this->data.assign(data, data + data_size);
         }
     }
 
-    mtmd_bitmap(const unsigned char * data, uint32_t n_samples)
+    // audio: data is float PCM samples (not raw bytes)
+    mtmd_bitmap(const float * data, uint32_t n_samples)
         : nx(n_samples), ny(1), is_audio(true) {
         if (data) {
             size_t data_size = (size_t)nx * sizeof(float);
-            this->data.resize(data_size);
-            std::memcpy(this->data.data(), data, data_size);
+            this->data.assign(reinterpret_cast<const unsigned char *>(data), reinterpret_cast<const unsigned char *>(data) + data_size);
         }
     }
 
     const std::vector<unsigned char> & get_ro_buf() const {
         return data;
+    }
+
+    void set_prefix_tokens(const llama_token * tokens, size_t n_tokens) {
+        prefix_tokens.assign(tokens, tokens + n_tokens);
+    }
+
+    const std::vector<llama_token> & get_prefix_tokens() const {
+        return prefix_tokens;
     }
 
     bool is_placeholder() const {
@@ -197,6 +204,7 @@ struct mtmd_bitmap {
 
   private:
     std::vector<unsigned char> data;
+    std::vector<llama_token> prefix_tokens; // per-position dual-stream prompt prefix (BOS + STREAMING_PAD), not text
 };
 
 // position indexing for decoder model
@@ -289,6 +297,7 @@ struct mtmd_audio_tokens {
     uint32_t n_tokens = 0; // number of tokens
     clip_image_f32_batch batch_f32; // preprocessed image patches
     std::string id; // optional user-defined ID, useful for KV cache tracking
+    std::vector<llama_token> prefix_tokens; // dual-stream prompt prefix (BOS + STREAMING_PAD), not text
 
     // true if one of entries in batch_f32 is a placeholder
     bool is_placeholder() const {
@@ -304,7 +313,8 @@ struct mtmd_audio_tokens {
         return mtmd_audio_tokens{
             n_tokens,
             batch_f32.clone(),
-            id
+            id,
+            prefix_tokens
         };
     }
 
@@ -494,7 +504,14 @@ struct mtmd_context {
     std::string media_marker;
     const int n_embd_text = -1; // -1 means llm context not provided, skip checking this
     const llama_vocab * vocab = nullptr; // can be nullptr if text_model is not provided
+    const llama_model * model = nullptr; // text model, for dual-stream token embeddings
     mtmd_pos_type pos_type;
+
+    // dual-stream scratch buffers (reused across mtmd_decode_step calls)
+    std::vector<uint8_t> dual_stream_raw;
+    std::vector<float>   dual_stream_row;
+    llama_batch          dual_stream_batch = { 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+    bool                 dual_stream_batch_ready = false;
 
     // these are not token, but strings used to mark the beginning and end of image/audio embeddings
     std::string img_beg;
@@ -536,6 +553,7 @@ struct mtmd_context {
         media_marker    (ctx_params.media_marker),
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
+        model           (text_model),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
         if (ctx_params.image_marker != nullptr) {
@@ -1005,6 +1023,10 @@ struct mtmd_context {
                 {
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_pockettts>(ctx_a);
                 } break;
+            case PROJECTOR_TYPE_VOXTRAL_RT_ASR:
+                {
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_voxtral_realtime>(ctx_a);
+                } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected audio projector type %d\n", __func__, proj));
         }
@@ -1043,6 +1065,9 @@ struct mtmd_context {
     }
 
     ~mtmd_context() {
+        if (dual_stream_batch_ready) {
+            llama_batch_free(dual_stream_batch);
+        }
         clip_free(ctx_a);
         clip_free(ctx_v);
         clip_free(ctx_gen_a);
@@ -1626,12 +1651,13 @@ struct mtmd_tokenizer {
                 audio_tokens->n_tokens = n_tokens;
                 audio_tokens->batch_f32 = std::move(batch_f32);
                 audio_tokens->id = bitmap->id; // optional
+                audio_tokens->prefix_tokens = bitmap->get_prefix_tokens();
 
                 LOG_DBG("audio_tokens->n_tokens = %d\n", audio_tokens->n_tokens);
 
                 mtmd_input_chunk chunk{
                     MTMD_INPUT_CHUNK_TYPE_AUDIO,
-                    {}, // text tokens
+                    {}, // no text tokens for audio chunks
                     nullptr, // image tokens
                     std::move(audio_tokens),
                 };
@@ -1796,6 +1822,60 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
     return ok ? 0 : 1;
 }
 
+// dequantize the token_embd row of `tok` into ctx->dual_stream_row.
+// returns false on missing tensor or out-of-range token.
+static bool dequantize_token_embd_row(mtmd_context * ctx, llama_token tok) {
+    const ggml_tensor * token_embd = llama_model_get_tensor_token_embd(ctx->model);
+    if (!token_embd) {
+        LOG_ERR("%s: model has no token_embd.weight\n", __func__);
+        return false;
+    }
+    if (tok < 0 || (int64_t) tok >= token_embd->ne[1]) {
+        return false; // out-of-range token
+    }
+    const size_t row_size = ggml_row_size(token_embd->type, token_embd->ne[0]);
+    const int64_t n_embd = token_embd->ne[0];
+    ctx->dual_stream_raw.resize(row_size);
+    ctx->dual_stream_row.resize((size_t) n_embd);
+    ggml_backend_tensor_get(token_embd, ctx->dual_stream_raw.data(), (size_t) tok * row_size, row_size);
+    ggml_get_type_traits(token_embd->type)->to_float(ctx->dual_stream_raw.data(), ctx->dual_stream_row.data(), n_embd);
+    return true;
+}
+
+// dual-stream summation: out_embd[i] += token_embd(prefix_tokens[i]) for the
+// positions covered by the attached prefix tokens (Voxtral realtime ASR).
+// positions beyond prefix_tokens (the streaming ones) stay pure audio embeddings.
+static bool mtmd_apply_dual_stream(mtmd_context * ctx, const mtmd_input_chunk * chunk, std::vector<float> & out_embd) {
+    if (ctx->proj_type_a() != PROJECTOR_TYPE_VOXTRAL_RT_ASR || !chunk->tokens_audio || chunk->tokens_audio->prefix_tokens.empty() || !ctx->model) {
+        return true; // no-op for other models
+    }
+
+    const int64_t n_tokens = (int64_t) chunk->tokens_audio->n_tokens;
+    const size_t  n_sum    = std::min((size_t) n_tokens, chunk->tokens_audio->prefix_tokens.size());
+    const int64_t n_embd   = (int64_t) (out_embd.size() / (size_t) n_tokens);
+    if (n_embd <= 0) {
+        return false;
+    }
+
+    // the streaming prompt repeats the same pad token, so memoize the last row
+    llama_token last_tok = LLAMA_TOKEN_NULL;
+    for (size_t i = 0; i < n_sum; ++i) {
+        const llama_token tok = chunk->tokens_audio->prefix_tokens[i];
+        if (tok != last_tok) {
+            if (!dequantize_token_embd_row(ctx, tok)) {
+                continue; // out-of-range token
+            }
+            last_tok = tok;
+        }
+        const float * row = ctx->dual_stream_row.data();
+        float * dst = out_embd.data() + i * (size_t) n_embd;
+        for (int64_t j = 0; j < n_embd; ++j) {
+            dst[j] += row[(size_t) j];
+        }
+    }
+    return true;
+}
+
 static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk * chunk, std::vector<float> & out_embd) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
@@ -1834,6 +1914,9 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
             ctx->n_threads,
             &chunk->tokens_audio->batch_f32,
             out_embd);
+        if (ok) {
+            ok = mtmd_apply_dual_stream(ctx, chunk, out_embd);
+        }
         return ok ? 0 : 1;
     }
 
@@ -1849,6 +1932,48 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return 1;
     }
+}
+
+int32_t mtmd_decode_step(mtmd_context * ctx,
+                         struct llama_context * lctx,
+                         const float * encoded_embd,
+                         llama_pos pos,
+                         llama_seq_id seq_id,
+                         llama_token tok,
+                         llama_token * out_token) {
+    if (ctx->proj_type_a() != PROJECTOR_TYPE_VOXTRAL_RT_ASR || !ctx->model || !ctx->vocab) {
+        return 1; // not a dual-stream model
+    }
+    if (!dequantize_token_embd_row(ctx, tok)) {
+        return 1; // out-of-range token
+    }
+
+    const int64_t n_embd = (int64_t) ctx->dual_stream_row.size();
+    // reuse the batch across steps to avoid per-token allocations
+    if (!ctx->dual_stream_batch_ready) {
+        ctx->dual_stream_batch = llama_batch_init(1, (int32_t) n_embd, 1);
+        ctx->dual_stream_batch_ready = true;
+    }
+    llama_batch & batch = ctx->dual_stream_batch;
+    batch.n_tokens = 1;
+    const float * tok_row = ctx->dual_stream_row.data();
+    const float * ae = encoded_embd + (size_t) pos * n_embd;
+    for (int64_t j = 0; j < n_embd; ++j) {
+        batch.embd[(size_t) j] = tok_row[(size_t) j] + ae[j];
+    }
+    batch.pos[0]       = pos;
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = seq_id;
+    batch.logits[0]    = true;
+
+    if (llama_decode(lctx, batch) != 0) {
+        return 1;
+    }
+
+    const float * logits = llama_get_logits_ith(lctx, 0);
+    const int32_t n_vocab = llama_vocab_n_tokens(ctx->vocab);
+    *out_token = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+    return 0;
 }
 
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
@@ -2185,6 +2310,10 @@ bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk
     }
 }
 
+bool mtmd_decode_use_dual_stream(const mtmd_context * ctx) {
+    return ctx->proj_type_a() == PROJECTOR_TYPE_VOXTRAL_RT_ASR;
+}
+
 bool mtmd_decode_use_mrope(const mtmd_context * ctx) {
     return ctx->pos_type == MTMD_POS_TYPE_MROPE;
 }
@@ -2223,7 +2352,7 @@ mtmd_bitmap * mtmd_bitmap_init(uint32_t nx,
 
 mtmd_bitmap * mtmd_bitmap_init_from_audio(size_t n_samples,
                                           const float * data) {
-    mtmd_bitmap * bitmap = new mtmd_bitmap((const unsigned char *)data, n_samples);
+    mtmd_bitmap * bitmap = new mtmd_bitmap(data, n_samples);
     GGML_ASSERT(bitmap->is_audio);
     if (!bitmap->is_placeholder()) {
         GGML_ASSERT(bitmap->get_ro_buf().size() == n_samples * sizeof(float));
@@ -2255,6 +2384,10 @@ size_t mtmd_bitmap_get_n_bytes(const mtmd_bitmap * bitmap) {
 
 bool mtmd_bitmap_is_audio(const mtmd_bitmap * bitmap) {
     return bitmap->is_audio;
+}
+
+void mtmd_bitmap_add_prefix_tokens(mtmd_bitmap * bitmap, const llama_token * tokens, size_t n_tokens) {
+    bitmap->set_prefix_tokens(tokens, n_tokens);
 }
 
 const char * mtmd_bitmap_get_id(const mtmd_bitmap * bitmap) {
@@ -2323,7 +2456,17 @@ enum mtmd_input_chunk_type mtmd_input_chunk_get_type(const mtmd_input_chunk * ch
 const llama_token * mtmd_input_chunk_get_tokens_text(const mtmd_input_chunk * chunk, size_t * n_tokens_output) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         *n_tokens_output = chunk->tokens_text.size();
-        return chunk->tokens_text.data();
+        return chunk->tokens_text.empty() ? nullptr : chunk->tokens_text.data();
+    }
+    *n_tokens_output = 0;
+    return nullptr;
+}
+
+// dual-stream prompt prefix of an audio chunk (BOS + STREAMING_PAD), not text
+const llama_token * mtmd_input_chunk_get_prefix_tokens(const mtmd_input_chunk * chunk, size_t * n_tokens_output) {
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO && chunk->tokens_audio) {
+        *n_tokens_output = chunk->tokens_audio->prefix_tokens.size();
+        return chunk->tokens_audio->prefix_tokens.empty() ? nullptr : chunk->tokens_audio->prefix_tokens.data();
     }
     *n_tokens_output = 0;
     return nullptr;
@@ -2569,6 +2712,23 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     };
     chunks->entries.emplace_back(std::move(chunk_image));
 
+    // create an audio chunk with a dual-stream prompt prefix
+    mtmd_audio_tokens_ptr audio_tokens(new mtmd_audio_tokens);
+    audio_tokens->n_tokens = 130;
+    audio_tokens->prefix_tokens = { 1, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32 }; // BOS + STREAMING_PAD
+    audio_tokens->id = "audio_1";
+    audio_tokens->batch_f32.entries.resize(1);
+    audio_tokens->batch_f32.is_audio = true;
+    // placeholder entry, buf is not serialized anyway
+    audio_tokens->batch_f32.entries[0].set_size({ 100, 80 }, true, true);
+    mtmd_input_chunk chunk_audio{
+        MTMD_INPUT_CHUNK_TYPE_AUDIO,
+        {}, // text tokens (must be empty for audio)
+        nullptr, // image tokens
+        std::move(audio_tokens),
+    };
+    chunks->entries.emplace_back(std::move(chunk_audio));
+
     return chunks;
 }
 
@@ -2694,6 +2854,35 @@ void mtmd_debug_preprocess_audio(mtmd_context * ctx, const std::vector<float> & 
             }
         }
     }
+}
+
+void mtmd_debug_preprocess_audio_dump(mtmd_context * ctx, const std::vector<float> & pcm_samples, const char * mel_path) {
+    if (!ctx->ctx_a) {
+        LOG_ERR("%s: model does not support audio input\n", __func__);
+        return;
+    }
+    std::vector<mtmd_audio_mel> mel_spec_chunks;
+    bool ok = ctx->audio_preproc->preprocess(pcm_samples.data(), pcm_samples.size(), mel_spec_chunks);
+    if (!ok) {
+        LOG_ERR("%s: failed to preprocess audio\n", __func__);
+        return;
+    }
+    if (mel_spec_chunks.empty()) {
+        LOG_ERR("%s: no mel chunks produced\n", __func__);
+        return;
+    }
+    // write the first chunk: [int32 n_mel*n_len][float mel-major data]
+    const auto & mel = mel_spec_chunks[0];
+    const int32_t n  = (int32_t) (mel.n_mel * mel.n_len);
+    FILE * fd = fopen(mel_path, "wb");
+    if (!fd) {
+        LOG_ERR("%s: cannot open %s for writing\n", __func__, mel_path);
+        return;
+    }
+    fwrite(&n, sizeof(int32_t), 1, fd);
+    fwrite(mel.data.data(), sizeof(float), (size_t) n, fd);
+    fclose(fd);
+    LOG_INF("%s: wrote mel (%d values) to %s\n", __func__, n, mel_path);
 }
 
 static void stub_log_callback(enum ggml_log_level, const char *, void *) {
